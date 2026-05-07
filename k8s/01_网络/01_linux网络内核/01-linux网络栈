@@ -1,0 +1,521 @@
+# 第一阶段完整拆解（Linux 网络内核 + K8s 网络）
+
+## Step 1：先完全脱离 K8s，直面 Linux 网络内核
+
+### 目标（非常明确）
+
+你要在 **没有 Kubernetes 的情况下**，理解：
+
+- 网络隔离是怎么做的
+- 数据包在内核里经历了哪些阶段
+
+### 为什么要先脱离 K8s？
+
+因为 **K8s 只是“编排者”，不是网络本体**。
+ 如果你一开始就在 K8s 里学，你永远会被 YAML 和 CNI 名词干扰。
+
+------
+
+### 你要学到什么（严格限定）
+
+只学下面这些，**一个都不能少，一个都不多**：
+
+1. **Network Namespace**
+   - 每个 netns = 一套独立网络栈
+2. **veth pair**
+   - namespace 之间的“网线”
+3. **Linux Bridge + ARP**
+   - 同机通信的二层真相
+4. **Routing / Policy Routing**
+   - 包为什么从这个口出去
+5. **Netfilter 钩子顺序**
+   - PREROUTING / FORWARD / POSTROUTING
+6. **DNAT / SNAT / Conntrack**
+   - Service 的底层机制
+
+> ⚠️ 不学：QoS、TC、BPF、DPDK、BGP
+>  ⚠️ 不看：内核源码
+
+------
+
+### 正确的学习动作（这是关键）
+
+**不是看书，不是刷博客，而是：**
+
+- 用 `ip netns` 手动创建 2–3 个 namespace
+- 用 veth 把它们接到宿主机
+- 用 bridge 让它们互通
+- 用 iptables 做一次 DNAT
+
+你要做的不是“生产级”，而是：
+
+> **“我亲手造过一条网络路径，我知道它为什么通。”**
+
+------
+
+### Step 1 验收标准（是否过线）
+
+你能在纸上**不看资料**画出并解释：
+
+- 一个包从 netns A → netns B
+- 在 Node 上经过的所有内核阶段
+- 如果慢 / 不通，你知道从哪三处开始查
+
+**能做到这一点，Linux 网络内核这一关，你就过了。**
+
+------
+
+## Step 2：再把 Kubernetes 网络“映射”到你已懂的内核模型上
+
+### 目标
+
+> **K8s 网络不是新东西，而是：
+>  把你刚才学的 Linux 网络，规模化、自动化地拼起来。**
+
+------
+
+### 你要学什么（只学必要的）
+
+#### 1️⃣ Pod 是什么？
+
+- = 一个 netns
+- = 一对 veth
+- = eth0 + route
+
+#### 2️⃣ CNI 干了什么？
+
+- 创建 netns
+- 插 veth
+- 配 IP / 路由
+- 把 veth 接到 bridge 或路由域
+
+#### 3️⃣ Service 干了什么？
+
+- kube-proxy 在 Node 上写规则
+- 用 DNAT 把 Service IP → Pod IP
+- 用 SNAT 保证回包
+
+------
+
+### 正确学习方式
+
+你要做的不是“学 CNI 插件”，而是：
+
+- 起一个 Pod
+- 进入 Node
+- 对照你第一步学的内容：
+  - veth 在哪？
+  - bridge / route 在哪？
+  - DNAT 在哪？
+
+👉 **你是在“对号入座”，不是重新学一套体系。**
+
+------
+
+### Step 2 验收标准（非常硬）
+
+你能回答这 4 个问题（不靠背）：
+
+1. Pod 的 eth0 是谁创建的？
+2. Pod 访问 ClusterIP，DNAT 在哪发生？
+3. 为什么 Service 需要 Conntrack？
+4. Service 高并发丢包，第一反应该查什么？
+
+**能答出来，你已经是“懂 K8s 网络的人”。**
+
+## 需要掌握的内容
+
+## 2️⃣ Linux 网络栈【必须掌握模块】（定稿清单）
+
+下面这 6 块，是**行业共识的“容器 / K8s 网络最低内核认知集”**。
+
+### A. Network Namespace（网络隔离模型）
+
+**你必须掌握：**
+
+- netns 是“一整套独立网络栈”
+- 每个 Pod = 一个 netns（事实标准）
+
+**你要达到的能力：**
+
+- 能解释 Pod 为什么“看起来像一台独立主机”
+- 能判断问题发生在 Pod 内还是 Node 侧
+
+📌 **依据**
+
+- Linux kernel networking docs
+- Kubernetes 官方定义：Pod network namespace（k8s.io）
+
+------
+
+### B. veth pair（容器接入内核的物理锚点）
+
+**你必须掌握：**
+
+- veth 成对存在
+- netns 边界就是 veth 边界
+
+**你要达到的能力：**
+
+- 能回答：“Pod 的 eth0 是谁创建的？”
+- 能判断丢包是在 Pod 内还是 Node 侧 veth
+
+📌 **依据**
+
+- CNI 规范（containernetworking/cni）
+- Docker / containerd 网络实现事实
+
+------
+
+### C. Bridge + ARP（二层通信）
+
+**你必须掌握：**
+
+- Linux bridge 是二层交换机
+- 同 Node Pod 通信 ≠ 路由
+
+**你要达到的能力：**
+
+- 能解释：同节点 Pod 为什么几乎不耗 CPU
+- 能定位：ARP 异常导致的“随机不通”
+
+📌 **依据**
+
+- Linux bridge 官方文档
+- 主流 CNI（bridge / flannel / calico 同节点路径）
+
+------
+
+### D. Routing / Policy Routing（三层路径选择）
+
+**你必须掌握：**
+
+- 路由表如何决定出口网卡
+- policy routing 的存在意义
+
+**你要达到的能力：**
+
+- 能解释：为什么包从这个 NIC 出去
+- 为未来 AI 节点多网卡打基础
+
+📌 **依据**
+
+- Linux iproute2 官方文档
+- NVIDIA / 阿里云 / AWS AI 节点网络实践白皮书
+
+------
+
+### E. Netfilter 钩子模型（数据包必经之路）
+
+**你必须掌握：**
+
+- PREROUTING / FORWARD / POSTROUTING 顺序
+- 路由决策发生在哪
+
+**你要达到的能力：**
+
+- 能把“慢 / 不通 / 丢包”对应到具体 hook
+
+📌 **依据**
+
+- Linux Netfilter 官方文档
+- kube-proxy 工作机制
+
+------
+
+### F. DNAT / SNAT / Conntrack（状态与规模）
+
+**你必须掌握：**
+
+- DNAT 改目标，SNAT 保回包
+- Conntrack 是“状态核心”
+
+**你要达到的能力：**
+
+- 能解释 ClusterIP 的本质
+- 能定位高并发 Service 丢包根因
+
+📌 **依据**
+
+- Kubernetes Service 官方实现说明
+- 大规模集群事故复盘（conntrack exhaustion 是高频原因）
+
+------
+
+## ✅ Linux 网络阶段目标（过线标准）
+
+> **你可以不看任何资料，
+>  在纸上画出：
+>  Pod → Pod（同机 / 跨机）
+>  Pod → Service
+>  并准确标出：
+>  netns / veth / bridge / route / DNAT / SNAT / conntrack**
+
+**做到这一点：Linux 网络阶段完成。**
+
+------
+
+# 三、Kubernetes 网络：你必须学什么（严格克制）
+
+## 1️⃣ K8s 网络你“不是在学新网络”
+
+**Kubernetes 网络 = Linux 网络的规模化编排。**
+
+所以你不是重新学一套系统，而是学：
+
+> **K8s 把 Linux 网络“自动化拼装”的方式。**
+
+------
+
+## 2️⃣ Kubernetes 网络【必须掌握模块】
+
+### A. Pod 网络模型（K8s 网络公理）
+
+**你必须掌握：**
+
+- Pod IP 全局可达（K8s 网络基本假设）
+- CNI 负责创建一切
+
+**你要达到的能力：**
+
+- 能解释 Pod IP 从哪来
+- 能判断是 CNI 问题还是应用问题
+
+📌 **依据**
+
+- Kubernetes Networking Model（官方文档）
+
+------
+
+### B. CNI 的职责边界
+
+**你必须掌握：**
+
+- CNI 只做 4 件事：
+  - 创建 netns
+  - 插 veth
+  - 配 IP
+  - 配路由
+
+**你要达到的能力：**
+
+- 不被 CNI 名字迷惑
+- 能从 Node 侧验证其行为
+
+📌 **依据**
+
+- CNI Spec（官方）
+
+------
+
+### C. Service（你必须吃透）
+
+**你必须掌握：**
+
+- kube-proxy 的角色
+- iptables / IPVS 的本质差异
+
+**你要达到的能力：**
+
+- 能解释 ClusterIP → Pod 的完整路径
+- 能判断什么时候该换实现方式
+
+📌 **依据**
+
+- Kubernetes Service 官方文档
+- kube-proxy 实现说明
+
+------
+
+### D. Node / LB / North-South（只理解职责）
+
+**你必须掌握：**
+
+- NodePort / LB 的数据路径角色
+- 不深究 Ingress 细节（第一阶段）
+
+**你要达到的能力：**
+
+- 能设计一个“可交付的基础入口方案”
+
+📌 **依据**
+
+- 云厂商 LB + K8s 集成文档（AWS/GCP/Aliyun）
+
+------
+
+## ✅ Kubernetes 网络阶段目标（过线标准）
+
+你能回答这 5 个问题（不靠背）：
+
+1. Pod 的 eth0 谁创建？
+2. Service DNAT 在哪发生？
+3. 为什么 Service 必须 SNAT？
+4. 高并发 Service 丢包最常见原因？
+5. 什么问题**不是** CNI 能解决的？
+
+**能答出来：K8s 网络阶段完成。**
+
+# Linux 网络全链路体系目录（从地基到云原生）
+
+## 0. 总览与方法论
+
+0.1 一条包的“证据链”思维：**抓包（tcpdump）+ 状态表（ip/conntrack）+ 计数器（iptables/ifstats）**
+ 0.2 排障顺序：先 L1/L2 → L3 → L4 → L7（避免在上层瞎猜）
+ 0.3 三类路径：本机发出（OUTPUT）/ 入站到本机（INPUT）/ 经过本机转发（FORWARD）
+
+------
+
+## 1. L2 数据链路层：MAC、ARP/邻居子系统（必须先掌握）
+
+1.1 同网段通信的前提：**下一跳 MAC**（不是目标 MAC 就一定是目标主机）
+ 1.2 ARP 解析流程：who-has / is-at
+ 1.3 邻居表与 NUD 状态机：INCOMPLETE/REACHABLE/STALE/DELAY/PROBE/FAILED/permanent
+ 1.4 常见故障：ARP 不回、ARP 冲突、静态 ARP 配错、二层丢帧
+ 1.5 工具：`ip neigh`、`tcpdump -e arp`、接口计数器
+
+✅ **本阶段目标**：你能证明“IP 包发送必须先得到下一跳 MAC”，并能用证据定位 ARP/邻居问题。
+
+------
+
+## 2. L3 网络层：路由/FIB、TTL、转发（先把“能到”讲清楚）
+
+2.1 路由基础：直连路由、默认路由、最长前缀匹配
+ 2.2 FIB 是什么：内核实际用于转发的转发表（你用 `ip route get` 看决策结果）
+ 2.3 TTL 机制：谁设置、每跳减一、何时回 ICMP Time Exceeded
+ 2.4 三种流量路径在 L3 的区别：本机/入站/转发
+ 2.5 常见故障：错路由、黑洞、ICMP 被屏蔽、路径不对称
+ 2.6 工具：`ip route`、`ip route get`、`traceroute/mtr`、`tcpdump icmp`
+
+✅ **本阶段目标**：你能解释 traceroute 的本质、能用 `ip route get` 证明“走哪张表/哪个出口”。
+
+------
+
+## 3. L3 扩展：策略路由 PBR / 多网卡分流（云原生/AI 必修）
+
+3.1 为什么需要 PBR：管理网/数据网分离、不同源地址走不同出口
+ 3.2 规则链：`ip rule` → `ip route table X` → 选路结果
+ 3.3 反向路径过滤 rp_filter：多出口最常见“回包被丢”元凶
+ 3.4 常见故障：走错网卡、回包不回、偶发断连
+ 3.5 工具：`ip rule`、`ip route get from ...`、`sysctl rp_filter`、抓包验证
+
+✅ **本阶段目标**：你能把“某类流量一定走数据网口”落成可验证配置，并解释 rp_filter 为何会丢包。
+
+------
+
+## 4. L4 传输层：TCP/UDP 基础排障（不读源码但要会定位）
+
+4.1 TCP 三次握手/四次挥手：SYN、SYN-ACK、ACK 的证据链
+ 4.2 常见现象分类：
+
+- SYN 发出无回（被丢/被拒）
+- 有回但应用不响应（上层/队列/拥塞）
+- 重传/窗口问题（性能/丢包）
+   4.3 工具：`ss -lntup`、`ss -ti`、`tcpdump 'tcp[tcpflags]'`、`nstat`
+
+✅ **本阶段目标**：你能区分“网络不通”和“TCP 建连不通”，并能用抓包证明问题在哪一步。
+
+------
+
+## 5. Netfilter/iptables：包在内核里“被检查/被改写”的位置
+
+5.1 netfilter 五大 hook 的正确心智模型：PREROUTING/INPUT/FORWARD/OUTPUT/POSTROUTING
+ 5.2 表与链：filter/nat/mangle/raw（哪些场景用哪个）
+ 5.3 计数器驱动排障：规则是否命中（-v -n）
+ 5.4 常见故障：规则顺序错、链路命中错、误 DROP、策略冲突
+
+✅ **本阶段目标**：你能回答“一个包进来/出去会经过哪些 hook”，并能用计数器定位是哪条规则改/拦了包。
+
+------
+
+## 6. Conntrack：状态跟踪与 NAT 的“回包还原”机制（Service/NAT 的灵魂）
+
+6.1 conntrack 记录什么：五元组、状态、NAT 映射
+ 6.2 SNAT/DNAT 的先后顺序与典型位置（PREROUTING vs POSTROUTING）
+ 6.3 表满症状：丢包、连接异常、insert_failed
+ 6.4 超时策略与关键 sysctl（只掌握核心几个）
+ 6.5 工具：`conntrack -S/-L`、dmesg、sysctl、抓包对照
+
+✅ **本阶段目标**：你能解释“为什么回包能回到内网主机/Pod”，以及“表满为什么会丢包”。
+
+------
+
+## 7. MTU / PMTU / 分片：overlay 时代的隐形杀手
+
+7.1 MTU/分片/DF 位：小包通大包挂的根因
+ 7.2 PMTU discovery：依赖 ICMP frag-needed（被屏蔽就出事故）
+ 7.3 工具：`ping -M do -s`、`tracepath`、抓包看 ICMP/DF
+ 7.4 常见故障：VXLAN/隧道下大包丢、gRPC/HTTP2 超时
+
+✅ **本阶段目标**：你能用实验复现“PMTU 黑洞”，并给出工程化修复建议（MTU 对齐/允许 ICMP/调 MSS）。
+
+------
+
+## 8. 性能路径：从 NIC 到内核再到 socket 的性能定位
+
+8.1 中断/NAPI/软中断：为什么会单核打满
+ 8.2 GRO/LRO、RPS/RFS、队列与 IRQ 亲和性：不求调到极致，但要会定位
+ 8.3 工具：`ethtool -S/-k`、`sar -n`、`/proc/net/softnet_stat`、`perf top`（可选）
+
+✅ **本阶段目标**：你能判断瓶颈在 NIC/驱动、软中断、TCP 栈还是应用处理。
+
+------
+
+## 9. DNS（现实世界的“伪网络故障”来源）
+
+9.1 解析链路：本机缓存/systemd-resolved/上游 DNS
+ 9.2 工具：`dig`、`resolvectl`、`tcpdump port 53`
+ 9.3 常见故障：解析慢、污染、DoH/代理干扰
+
+✅ **本阶段目标**：你能快速排除“网络其实通但 DNS 坏了”的情况。
+
+------
+
+## 10. 迁移到容器：Network Namespace + veth + bridge（把 Linux 组合题做出来）
+
+10.1 netns 隔离：为什么 Pod 有独立网络栈
+ 10.2 veth/bridge：Pod eth0 如何接到宿主机
+ 10.3 宿主机路由与 iptables：Pod 出网、回包路径
+ 10.4 工具：`ip netns`、`nsenter`、`tcpdump -i any`、`ip link`
+
+✅ **本阶段目标**：单机复现“Pod ↔ Node ↔ 外网”的最小网络。
+
+------
+
+## 11. 迁移到 K8s：Pod → Service → Node → LB 的映射
+
+11.1 Service 的本质：DNAT/SNAT + conntrack（或 eBPF dataplane）
+ 11.2 kube-proxy（iptables/ipvs）与数据路径
+ 11.3 常见故障：Service 不通、NodePort 异常、conntrack 表压力
+ 11.4 观测：抓包位置选择、iptables 规则定位、conntrack 状态
+
+✅ **本阶段目标**：你能把“Linux 全链路”直接映射到 K8s 网络排障。
+
+
+
+
+
+
+
+
+
+
+
+# 总结
+
+
+
+## 1. 五层模型里数据包如何流转
+
+### 1.1 每一层作用概览
+
+-  **L2 负责“把帧送到同一链路上的下一跳”**（看 MAC）
+
+- **L3 负责“把包送到目的网络/目的主机”**（看 IP、路由、TTL）
+
+- **L4 负责“把数据送到正确的进程/会话并提供传输语义”**（TCP/UDP 端口、握手、重传等）
+
+- **L5(应用) 负责“业务语义”**（HTTP、gRPC、DNS 等）
+
+  **NAT/防火墙/netfilter 是 Linux 内核对 L3/L4 报文做‘过滤/改写/状态跟踪’的机制**，典型发生在**IP 包已经存在之后**（因为 NAT 改的是 IP/端口），且在**出站/入站/转发的不同钩子点**执行。
+
